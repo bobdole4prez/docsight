@@ -70,6 +70,10 @@ class HitronCoda4680Driver(ModemDriver):
             if not isinstance(body, dict):
                 raise RuntimeError("Hitron CODA-4680 login returned invalid JSON payload")
             self._ensure_ok(body, "login")
+            # A wrong password still answers errCode "000"; the outcome is in
+            # "result", which the modem's own login page requires to be "success".
+            if "result" in body and body["result"] != "success":
+                raise RuntimeError(f"Hitron CODA-4680 login rejected: {body['result']}")
 
         # The login response can be an empty 200. Verify that the authenticated
         # session can read a protected endpoint before reporting success.
@@ -145,6 +149,16 @@ class HitronCoda4680Driver(ModemDriver):
             log.warning("Hitron CODA-4680 fetch %s failed: %s", path, exc)
             return {}
 
+        if payload is None and self._is_login_page(resp):
+            # Without a valid session the modem redirects to its HTML login
+            # page and answers 200 instead of 401.
+            if allow_reauth:
+                log.info("Hitron CODA-4680 endpoint %s returned the login page; retrying after login", path)
+                return self._retry_after_reauth(path, raise_on_error=raise_on_error)
+            if raise_on_error:
+                raise RuntimeError(f"Hitron CODA-4680 login rejected: {path} returned the login page")
+            log.warning("Hitron CODA-4680 fetch %s returned the login page", path)
+            return {}
         if not isinstance(payload, dict):
             if raise_on_error:
                 raise RuntimeError(f"Hitron CODA-4680 fetch {path} returned invalid JSON payload")
@@ -175,6 +189,11 @@ class HitronCoda4680Driver(ModemDriver):
     @staticmethod
     def _is_auth_payload(payload: Any) -> bool:
         return isinstance(payload, dict) and str(payload.get("errCode", "")) in {"401", "403"}
+
+    @staticmethod
+    def _is_login_page(resp: requests.Response) -> bool:
+        text = getattr(resp, "text", "")
+        return isinstance(text, str) and text.lstrip().startswith("<")
 
     @staticmethod
     def _json_body(resp: requests.Response) -> Any:

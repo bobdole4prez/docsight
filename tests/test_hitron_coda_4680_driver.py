@@ -9,6 +9,7 @@ import requests
 from app.analyzer import analyze
 from app.drivers import driver_registry
 from app.drivers.hitron_coda_4680 import HitronCoda4680Driver
+from app.modem_diagnosis import AUTH, classify_failure
 
 
 DS_INFO = {
@@ -151,6 +152,17 @@ def make_http_error_response(status_code=403):
     return resp
 
 
+LOGIN_PAGE_HTML = "<!DOCTYPE html>\n<html lang='en'>\n<head>\n    <meta charset=\"utf-8\">\n"
+
+
+def make_login_page_response():
+    resp = MagicMock(status_code=200)
+    resp.raise_for_status = MagicMock()
+    resp.text = LOGIN_PAGE_HTML
+    resp.json.side_effect = ValueError("not JSON")
+    return resp
+
+
 @pytest.fixture
 def driver():
     return HitronCoda4680Driver("http://192.168.100.1", "username", "secret")
@@ -193,6 +205,34 @@ class TestLogin:
         with patch.object(driver._session, "post", return_value=make_response(["not", "an", "object"])):
             with pytest.raises(RuntimeError, match="login returned invalid JSON payload"):
                 driver.login()
+
+
+    def test_login_accepts_success_result(self, driver):
+        body = {"errCode": "000", "errMsg": "", "result": "success"}
+        with patch.object(driver._session, "post", return_value=make_response(body)):
+            with patch.object(driver, "_fetch_payload", return_value=VERSION) as fetch:
+                driver.login()
+
+        fetch.assert_called_once_with("/1/Device/CM/Version", raise_on_error=True, allow_reauth=False)
+
+    def test_login_rejects_wrong_password_result_as_auth_failure(self, driver):
+        body = {"errCode": "000", "errMsg": "", "result": "Error_Password_Wrong"}
+        with patch.object(driver._session, "post", return_value=make_response(body)):
+            with patch.object(driver, "_fetch_payload") as fetch:
+                with pytest.raises(RuntimeError, match="login rejected: Error_Password_Wrong") as exc_info:
+                    driver.login()
+
+        fetch.assert_not_called()
+        assert classify_failure(exc_info.value, "login") == AUTH
+
+    def test_login_reports_login_page_from_version_check_as_auth_failure(self, driver):
+        with patch.object(driver._session, "post", return_value=make_response(None)):
+            with patch.object(driver._session, "get", return_value=make_login_page_response()) as get:
+                with pytest.raises(RuntimeError, match="login rejected: /1/Device/CM/Version returned the login page") as exc_info:
+                    driver.login()
+
+        get.assert_called_once()
+        assert classify_failure(exc_info.value, "login") == AUTH
 
 
 class TestDeviceInfo:
@@ -311,6 +351,41 @@ class TestDocsisData:
             return_value=make_response({"errCode": "999", "errMsg": "temporary unavailable"}),
         ):
             assert driver._fetch_payload("/1/Device/CM/DsInfo") == {}
+
+    def test_fetch_payload_reauthenticates_once_after_login_page(self, driver):
+        with patch.object(
+            driver._session,
+            "get",
+            side_effect=[make_login_page_response(), make_response(DS_INFO)],
+        ) as get:
+            with patch.object(driver, "login") as login:
+                payload = driver._fetch_payload("/1/Device/CM/DsInfo")
+
+        assert payload == DS_INFO
+        login.assert_called_once_with()
+        assert get.call_count == 2
+
+    def test_fetch_payload_does_not_loop_when_login_page_returns_after_reauth(self, driver):
+        with patch.object(
+            driver._session,
+            "get",
+            side_effect=[make_login_page_response(), make_login_page_response()],
+        ) as get:
+            with patch.object(driver, "login") as login:
+                payload = driver._fetch_payload("/1/Device/CM/DsInfo")
+
+        assert payload == {}
+        login.assert_called_once_with()
+        assert get.call_count == 2
+
+    def test_fetch_payload_empty_body_is_not_treated_as_login_page(self, driver):
+        with patch.object(driver._session, "get", return_value=make_response(None)) as get:
+            with patch.object(driver, "login") as login:
+                payload = driver._fetch_payload("/1/Device/CM/DsInfo")
+
+        assert payload == {}
+        login.assert_not_called()
+        get.assert_called_once()
 
     @pytest.mark.parametrize("err_code", ["401", "403"])
     def test_fetch_payload_reauthenticates_once_after_auth_error_payload(self, driver, err_code):
